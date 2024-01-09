@@ -628,6 +628,7 @@ gsk_gl_driver_after_frame (GskGLDriver *self)
    * self->autorelease_framebuffers) so we can release the FBOs immediately
    * afterwards.
    */
+#if 0
   while (self->render_targets->len > 0)
     {
       GskGLRenderTarget *render_target = g_ptr_array_index (self->render_targets, self->render_targets->len - 1);
@@ -654,6 +655,8 @@ gsk_gl_driver_after_frame (GskGLDriver *self)
                         (GLuint *)(gpointer)self->texture_pool->data);
       self->texture_pool->len = 0;
     }
+
+#endif
 
   /* Reset command queue to our shared queue in case we have operations
    * that need to be processed outside of a frame (such as callbacks
