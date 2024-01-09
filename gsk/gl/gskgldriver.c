@@ -37,6 +37,8 @@
 #include "gskglshadowlibraryprivate.h"
 #include "fp16private.h"
 
+#include <gsk/gl/gskglrenderer.h>
+#include <gsk/gl/gskglrendererprivate.h>
 #include <gdk/gdkglcontextprivate.h>
 #include <gdk/gdkdisplayprivate.h>
 #include <gdk/gdkmemorytextureprivate.h>
@@ -132,7 +134,7 @@ gsk_gl_driver_collect_unused_textures (GskGLDriver *self,
       if (t->user || t->permanent)
         continue;
 
-      if (t->last_used_in_frame <= watermark)
+      if (t->last_used_in_frame <= watermark && (!t->is_render_target || !t->can_reuse))
         {
           g_hash_table_iter_steal (&iter);
 
@@ -698,15 +700,15 @@ gsk_gl_driver_cache_texture (GskGLDriver         *self,
   g_assert (texture_id > 0);
   g_assert (g_hash_table_contains (self->textures, GUINT_TO_POINTER (texture_id)));
 
-  if (!g_hash_table_contains (self->key_to_texture_id, key))
+  if (!g_hash_table_contains (self->key_to_texture_id, key) && !g_hash_table_contains (self->texture_id_to_key, GUINT_TO_POINTER (texture_id)))
     {
       GskTextureKey *k;
 
       k = g_memdup (key, sizeof *key);
 
-      g_assert (!g_hash_table_contains (self->texture_id_to_key, GUINT_TO_POINTER (texture_id)));
       g_hash_table_insert (self->key_to_texture_id, k, GUINT_TO_POINTER (texture_id));
-      g_hash_table_insert (self->texture_id_to_key, GUINT_TO_POINTER (texture_id), k);
+      if (!g_hash_table_contains (self->texture_id_to_key, GUINT_TO_POINTER (texture_id)))
+        g_hash_table_insert (self->texture_id_to_key, GUINT_TO_POINTER (texture_id), k);
     }
 }
 
@@ -882,6 +884,13 @@ gsk_gl_driver_release_texture (GskGLDriver  *self,
   g_assert (GSK_IS_GL_DRIVER (self));
   g_assert (texture != NULL);
 
+  if (texture->is_render_target)
+    {
+      texture->can_reuse = TRUE;
+      texture->last_used_in_frame = 0;
+      return;
+    }
+
   texture_id = texture->texture_id;
   texture->texture_id = 0;
   gsk_gl_texture_free (texture);
@@ -928,22 +937,35 @@ gsk_gl_driver_create_render_target (GskGLDriver        *self,
   g_return_val_if_fail (GSK_IS_GL_COMMAND_QUEUE (self->command_queue), FALSE);
   g_return_val_if_fail (out_render_target != NULL, FALSE);
 
-#if 0
-  if (self->render_targets->len > 0)
+  for (guint i = self->render_targets->len; i > 0; i--)
     {
-      for (guint i = self->render_targets->len; i > 0; i--)
-        {
-          GskGLRenderTarget *render_target = g_ptr_array_index (self->render_targets, i-1);
+      GskGLRenderTarget *render_target = g_ptr_array_index (self->render_targets, i-1);
 
-          if (render_target->width == width &&
-              render_target->height == height)
+      if (render_target->width == width &&
+          render_target->height == height &&
+          render_target->format == format)
+        {
+          texture_id = render_target->texture_id;
+          if (g_hash_table_contains (self->textures, GUINT_TO_POINTER (texture_id)))
             {
-              *out_render_target = g_ptr_array_steal_index_fast (self->render_targets, i-1);
-              return TRUE;
+              GskGLTexture *texture = g_hash_table_lookup (self->textures, GUINT_TO_POINTER (texture_id));
+              if (texture->last_used_in_frame == self->current_frame_id || (texture->is_render_target && !texture->can_reuse))
+                {
+                  // printf("skipping rt for id %d with size %dx%d because %s\n", render_target->texture_id, render_target->width, render_target->height, texture->last_used_in_frame == self->current_frame_id ? "used this frame" : "is a render target");
+                  continue;
+                }
+              texture->last_used_in_frame = self->current_frame_id;
             }
+          else
+            continue;
+
+          // printf("managed to reuse render target with id %d and size %dx%d\n", render_target->texture_id, render_target->width, render_target->height);
+          *out_render_target = render_target;
+          return TRUE;
         }
     }
-#endif
+
+  // printf("dang, gotta create a new render target with size %dx%d\n", width, height);
 
   if (gsk_gl_command_queue_create_render_target (self->command_queue,
                                                   width, height,
@@ -960,6 +982,8 @@ gsk_gl_driver_create_render_target (GskGLDriver        *self,
       render_target->texture_id = texture_id;
 
       *out_render_target = render_target;
+
+      g_ptr_array_add (self->render_targets, render_target);
 
       return TRUE;
     }
@@ -1001,29 +1025,46 @@ gsk_gl_driver_release_render_target (GskGLDriver       *self,
 
   if (release_texture)
     {
-      texture_id = 0;
-      g_ptr_array_add (self->render_targets, render_target);
+      // Just mark it as reusable starting next frame. We don't mark it for this frame
+      // in case someone painted to it and wants to render it.
+      GskGLTexture *texture = g_hash_table_lookup (self->textures, GUINT_TO_POINTER (render_target->texture_id));
+      if (texture)
+        {
+          // printf("freed render target with id %d and size %dx%d\n", render_target->texture_id, render_target->width, render_target->height);
+          texture->can_reuse = TRUE;
+          texture->last_used_in_frame = self->current_frame_id;
+        }
+      return 0;
+    }
+
+  texture_id = render_target->texture_id;
+  if (g_hash_table_contains (self->textures, GUINT_TO_POINTER (texture_id)))
+    {
+      // Set last used to current frame so we don't release it
+      GskGLTexture *texture = g_hash_table_lookup (self->textures, GUINT_TO_POINTER (texture_id));
+      if (texture)
+        {
+          texture->last_used_in_frame = self->current_frame_id;
+          texture->can_reuse = FALSE;
+        }
+      return texture_id;
     }
   else
     {
       GskGLTexture *texture;
 
-      texture_id = render_target->texture_id;
-
       texture = gsk_gl_texture_new (render_target->texture_id,
-                                     render_target->width,
-                                     render_target->height,
-                                     self->current_frame_id);
+                                    render_target->width,
+                                    render_target->height,
+                                    self->current_frame_id);
+      texture->is_render_target = TRUE;
+
       g_hash_table_insert (self->textures,
-                           GUINT_TO_POINTER (texture_id),
-                           g_steal_pointer (&texture));
+                            GUINT_TO_POINTER (texture_id),
+                            g_steal_pointer (&texture));
 
-      gsk_gl_driver_autorelease_framebuffer (self, render_target->framebuffer_id);
-      g_free (render_target);
-
+      return texture_id;
     }
-
-  return texture_id;
 }
 
 /**
@@ -1627,13 +1668,14 @@ gsk_gl_driver_create_gdk_texture (GskGLDriver     *self,
   if (!(texture = g_hash_table_lookup (self->textures, GUINT_TO_POINTER (texture_id))))
     g_return_val_if_reached (NULL);
 
+  if (texture->user)
+    return texture->user;
+
   state = g_new0 (GskGLTextureState, 1);
   state->texture_id = texture_id;
   state->context = g_object_ref (self->command_queue->context);
   if (gdk_gl_context_has_sync (self->command_queue->context))
     state->sync = glFenceSync (GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-
-  g_hash_table_steal (self->textures, GUINT_TO_POINTER (texture_id));
 
   builder = gdk_gl_texture_builder_new ();
   gdk_gl_texture_builder_set_context (builder, self->command_queue->context);
@@ -1647,9 +1689,10 @@ gsk_gl_driver_create_gdk_texture (GskGLDriver     *self,
                                          create_texture_from_texture_destroy,
                                          state);
 
-  texture->texture_id = 0;
-  gsk_gl_texture_free (texture);
   g_object_unref (builder);
+
+  texture->user = g_object_ref (result);
+  texture->last_used_in_frame = self->current_frame_id;
 
   return result;
 }

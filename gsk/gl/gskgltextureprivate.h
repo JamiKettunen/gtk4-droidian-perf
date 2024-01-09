@@ -75,6 +75,10 @@ struct _GskGLTexture
   guint              permanent : 1;
   /* we called glGenerateMipmap() for this texture */
   guint              has_mipmap : 1;
+  /* This texture belongs to a render target */
+  guint              is_render_target : 1;
+  /* This render target bound texture can be reused */
+  guint              can_reuse : 1;
 };
 
 GskGLTexture                * gsk_gl_texture_new            (guint                 texture_id,

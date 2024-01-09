@@ -1300,6 +1300,7 @@ blur_offscreen (GskGLRenderJob       *job,
   graphene_matrix_t prev_projection;
   graphene_rect_t prev_viewport;
   guint prev_fbo;
+  guint texture_id;
 
   g_assert (blur_radius_x > 0);
   g_assert (blur_radius_y > 0);
@@ -1399,7 +1400,10 @@ blur_offscreen (GskGLRenderJob       *job,
 
   gsk_gl_driver_release_render_target (job->driver, pass1, TRUE);
 
-  return gsk_gl_driver_release_render_target (job->driver, pass2, FALSE);
+  texture_id = gsk_gl_driver_release_render_target (job->driver, pass2, FALSE);
+  // Make the render target available for reuse
+  gsk_gl_driver_release_render_target (job->driver, pass2, TRUE);
+  return texture_id;
 }
 
 static void
@@ -2585,6 +2589,9 @@ gsk_gl_render_job_visit_blurred_outset_shadow_node (GskGLRenderJob      *job,
       /* Now blur the outline */
       init_full_texture_region (&offscreen);
       offscreen.texture_id = gsk_gl_driver_release_render_target (job->driver, render_target, FALSE);
+
+      /* Make the RT available for reuse */
+      gsk_gl_driver_release_render_target (job->driver, render_target, TRUE);
       blurred_texture_id = blur_offscreen (job,
                                            &offscreen,
                                            texture_width,
