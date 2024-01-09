@@ -487,7 +487,11 @@ free_driver (GskGLDriver *driver)
 static void
 display_closed (GdkDisplay *display)
 {
-  g_object_set_data (G_OBJECT (display), "GSK_GL_DRIVER", NULL);
+  const pthread_t thread_id = pthread_self ();
+  char thread_key[64];
+  sprintf (thread_key, "GSK_GL_DRIVER_%lu", thread_id);
+
+  g_object_set_data (G_OBJECT (display), thread_key, NULL);
 }
 
 /**
@@ -513,7 +517,11 @@ gsk_gl_driver_for_display (GdkDisplay  *display,
 
   g_return_val_if_fail (GDK_IS_DISPLAY (display), NULL);
 
-  if ((driver = g_object_get_data (G_OBJECT (display), "GSK_GL_DRIVER")))
+  const pthread_t thread_id = pthread_self ();
+  char thread_key[64];
+  sprintf (thread_key, "GSK_GL_DRIVER_%lu", thread_id);
+
+  if ((driver = g_object_get_data (G_OBJECT (display), thread_key)))
     return g_object_ref (driver);
 
   context = gdk_display_get_gl_context (display);
@@ -533,7 +541,7 @@ gsk_gl_driver_for_display (GdkDisplay  *display,
     goto failure;
 
   g_object_set_data_full (G_OBJECT (display),
-                          "GSK_GL_DRIVER",
+                          thread_key,
                           g_object_ref (driver),
                           (GDestroyNotify) free_driver);
   g_signal_connect (display, "closed", G_CALLBACK (display_closed), NULL);

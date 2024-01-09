@@ -23,6 +23,9 @@
 #include <gdk/gdkprofilerprivate.h>
 #include <gdk/gdkdisplayprivate.h>
 #include <gdk/gdkglcontextprivate.h>
+#include <gsk/gskrendererprivate.h>
+#include <gsk/gl/gskglrenderer.h>
+#include <gsk/gl/gskglrendererprivate.h>
 #include <gdk/gdksurfaceprivate.h>
 #include <glib/gi18n-lib.h>
 #include <gsk/gskdebugprivate.h>
@@ -39,6 +42,12 @@ struct _GskGLRendererClass
 {
   GskRendererClass parent_class;
 };
+
+typedef struct {
+  GAsyncQueue *command_queue;
+  GAsyncQueue *response_queue;
+  pthread_t gl_thread;  
+} gl_worker;
 
 struct _GskGLRenderer
 {
@@ -63,6 +72,9 @@ struct _GskGLRenderer
    * caches through various helpers.
    */
   GskGLDriver *driver;
+
+  /* The worker thread that will actually do the rendering. */
+  gl_worker *worker;
 };
 
 G_DEFINE_TYPE (GskGLRenderer, gsk_gl_renderer, GSK_TYPE_RENDERER)
@@ -427,6 +439,190 @@ gsk_gl_renderer_dispose (GObject *object)
   G_OBJECT_CLASS (gsk_gl_renderer_parent_class)->dispose (object);
 }
 
+#define GL_REALIZE 0
+#define GL_UNREALIZE 1
+#define GL_RENDER 2
+#define GL_RENDER_TEXTURE 3
+
+typedef struct {
+  GskRenderer *renderer;
+  GdkSurface *surface;
+  GError **error;
+} realize_args;
+
+typedef struct {
+  GskRenderer *renderer;
+} unrealize_args;
+
+typedef struct {
+  GskRenderer *renderer;
+  GskRenderNode *root;
+  const graphene_rect_t *viewport;
+} render_args;
+
+typedef struct {
+  int type;
+  union {
+    realize_args realize;
+    unrealize_args unrealize;
+    render_args render;
+  };
+} gl_args;
+
+typedef struct {
+  gboolean status;
+} realize_ret;
+
+typedef struct {
+  GdkTexture *texture;
+} render_texture_ret;
+
+typedef struct {
+  int type;
+  union {
+    realize_ret realize;
+    render_texture_ret render_texture;
+  };
+} gl_ret;
+
+void *gl_thread_func(void *arg) {
+  gl_args *args;
+  gl_ret *ret;
+  GskRenderNode *root;
+  gl_worker *self = (gl_worker *) arg;
+
+  while (1) {
+    // printf("Queue length: %d\n", g_async_queue_length(self->command_queue));
+    args = g_async_queue_pop(self->command_queue);
+    switch (args->type) {
+      case GL_REALIZE:
+        ret = g_new(gl_ret, 1);
+        ret->type = GL_REALIZE;
+        ret->realize.status = gsk_gl_renderer_realize(args->realize.renderer, args->realize.surface, args->realize.error);
+        g_async_queue_push(self->response_queue, ret);
+        break;
+      case GL_UNREALIZE:
+        gsk_gl_renderer_unrealize(args->unrealize.renderer);
+        g_free(args);
+        return;
+      case GL_RENDER:
+        if (g_async_queue_length(self->command_queue) > 0) {
+          // printf("Falling behind, skipping render\n");
+          break;
+        }
+        root = args->render.root;
+        gsk_gl_renderer_render(args->render.renderer, root, args->render.viewport);
+        cairo_region_destroy(args->render.viewport);
+        gsk_render_node_unref(root);
+        break;
+      case GL_RENDER_TEXTURE:
+        root = args->render.root;
+        ret = g_new(gl_ret, 1);
+        ret->type = GL_RENDER_TEXTURE;
+        ret->render_texture.texture = gsk_gl_renderer_render_texture(args->render.renderer, root, args->render.viewport);
+        if (args->render.viewport != NULL) {
+          graphene_rect_free(args->render.viewport);
+        }
+        gsk_render_node_unref(root);
+        g_async_queue_push(self->response_queue, ret);
+        break;
+    }
+    g_free(args);
+  }
+}
+
+static gboolean
+gsk_gl_renderer_realize_threaded (GskRenderer  *renderer,
+                                  GdkSurface   *surface,
+                                  GError      **error)
+{
+  gl_worker *worker = g_new(gl_worker, 1);
+  worker->command_queue = g_async_queue_new();
+  worker->response_queue = g_async_queue_new();
+
+  GskGLRenderer *self = (GskGLRenderer *)renderer;
+  self->worker = worker;
+
+  pthread_create(&worker->gl_thread, NULL, gl_thread_func, worker);
+
+  gl_args *args = g_new(gl_args, 1);
+  args->type = GL_REALIZE;
+  args->realize.renderer = renderer;
+  args->realize.surface = surface;
+  args->realize.error = error;
+  g_async_queue_push(worker->command_queue, args);
+
+  gl_ret *ret = g_async_queue_pop(worker->response_queue);
+  gboolean status = ret->realize.status;
+  g_free(ret);
+
+  return status;
+}
+
+static void
+gsk_gl_renderer_unrealize_threaded (GskRenderer *renderer)
+{
+  GskGLRenderer *self = (GskGLRenderer *)renderer;
+  gl_worker *worker = self->worker;
+
+  gl_args *args = g_new(gl_args, 1);
+  args->type = GL_UNREALIZE;
+  args->unrealize.renderer = renderer;
+  g_async_queue_push(worker->command_queue, args);
+}
+
+static void
+gsk_gl_renderer_render_threaded (GskRenderer          *renderer,
+                                 GskRenderNode        *root,
+                                 const cairo_region_t *update_area)
+{
+  GskGLRenderer *self = (GskGLRenderer *)renderer;
+  gl_worker *worker = self->worker;
+
+  gl_args *args = g_new(gl_args, 1);
+  args->type = GL_RENDER;
+  args->render.renderer = renderer;
+  // Grab a ref to the root node so it doesn't get freed before we render it
+  gsk_render_node_ref (root);
+  args->render.root = root;
+
+  args->render.viewport = cairo_region_copy(update_area);
+  g_async_queue_push(worker->command_queue, args);
+}
+
+static GdkTexture *
+gsk_gl_renderer_render_texture_threaded (GskRenderer           *renderer,
+                                         GskRenderNode         *root,
+                                         const graphene_rect_t *viewport)
+{
+  GskGLRenderer *self = (GskGLRenderer *)renderer;
+  gl_worker *worker = self->worker;
+
+  gl_args *args = g_new(gl_args, 1);
+  args->type = GL_RENDER_TEXTURE;
+  args->render.renderer = renderer;
+  // Grab a ref to the root node so it doesn't get freed before we render it
+  gsk_render_node_ref (root);
+  args->render.root = root;
+
+  if (viewport != NULL)
+  {
+    graphene_rect_t *clone = graphene_rect_alloc();
+    args->render.viewport = graphene_rect_init_from_rect(clone, viewport);
+  }
+
+  g_async_queue_push(worker->command_queue, args);
+
+  // TODO: this is a blocking call. Is it possible to make it async?
+  // Probably not without breaking the API contract...
+  gl_ret *ret = g_async_queue_pop(worker->response_queue);
+  GdkTexture *texture = ret->render_texture.texture;
+  g_free(ret);
+  return texture;
+}
+
+// #define DISABLE_GL_THREADING
+
 static void
 gsk_gl_renderer_class_init (GskGLRendererClass *klass)
 {
@@ -435,10 +631,17 @@ gsk_gl_renderer_class_init (GskGLRendererClass *klass)
 
   object_class->dispose = gsk_gl_renderer_dispose;
 
+#ifdef DISABLE_GL_THREADING
   renderer_class->realize = gsk_gl_renderer_realize;
   renderer_class->unrealize = gsk_gl_renderer_unrealize;
   renderer_class->render = gsk_gl_renderer_render;
   renderer_class->render_texture = gsk_gl_renderer_render_texture;
+#else
+  renderer_class->realize = gsk_gl_renderer_realize_threaded;
+  renderer_class->unrealize = gsk_gl_renderer_unrealize_threaded;
+  renderer_class->render = gsk_gl_renderer_render_threaded;
+  renderer_class->render_texture = gsk_gl_renderer_render_texture_threaded;
+#endif
 }
 
 static void
